@@ -1,126 +1,126 @@
-# Gemini API & Proxy Server (Original)
+# Gemini API & Proxy Server
 
 <p align="center">
     <img src="https://raw.githubusercontent.com/HanaokaYuzu/Gemini-API/master/assets/banner.png" width="55%" alt="Gemini Banner" align="center">
 </p>
 
-Este projeto é um **wrapper e servidor proxy local de alta performance** que disponibiliza a inteligência do Google Gemini de forma gratuita para qualquer cliente ou aplicação de terceiros. Ao emular protocolos de comunicação da indústria, ele atua como uma ponte entre seus editores de código (como Cursor e VS Code), assistentes virtuais ou ferramentas de IA, e a interface web oficial do Gemini.
+This project is a **high-performance local proxy server and wrapper** that makes Google Gemini's intelligence available for free to any third-party client or application. By emulating industry-standard communication protocols, it acts as a bridge between your code editors (like Cursor and VS Code), virtual assistants, or AI tools, and the official Gemini web interface.
 
-Totalmente escrito em **Python** e construído sobre a automação do **Playwright**, este servidor permite que você use o modelo mais atualizado do Gemini com suporte a Visão (imagens), pensamento estendido (Extended Thinking) e reconhecimento de voz (Speech-to-Text) sem precisar pagar por tokens de API oficial.
+Completely written in **Python** and built on top of **Playwright** automation, this server allows you to use the most up-to-date Gemini model with support for Vision (images), Extended Thinking, and Speech-to-Text without paying for official API tokens.
 
 ---
 
-## 🔍 Como o Projeto Funciona por Baixo dos Panos
+## 🔍 How the Project Works Under the Hood
 
-O segredo deste projeto reside na capacidade de automatizar e interagir com o site do [Google Gemini Web](https://gemini.google.com/) da mesma forma que um humano faria, porém de forma programática, rápida e invisível.
+The secret of this project lies in its ability to automate and interact with the [Google Gemini Web](https://gemini.google.com/) site in the same way a human would, but programmatically, quickly, and invisibly.
 
 ```mermaid
 graph TD
-    Client[Cliente / Editor / App] -->|Requisição HTTP / OpenAI / STT| FastAPI[Servidor FastAPI Proxy]
-    FastAPI -->|Orquestração| Pool[Playwright Gemini Pool]
-    Pool -->|Automação de Navegador| Chromium[Navegador Chromium Headless]
-    Chromium -->|Interação DOM| GeminiWeb[Gemini Web Interface]
-    GeminiWeb -->|Resposta Web| Chromium
-    Chromium -->|Extração de Resposta e Pensamento| Pool
-    Pool -->|Retorno de Dados| FastAPI
-    FastAPI -->|Resposta OpenAI / STT Formatada| Client
+    Client[Client / Editor / App] -->|HTTP / OpenAI / STT Request| FastAPI[FastAPI Proxy Server]
+    FastAPI -->|Orchestration| Pool[Playwright Gemini Pool]
+    Pool -->|Browser Automation| Chromium[Headless Chromium Browser]
+    Chromium -->|DOM Interaction| GeminiWeb[Gemini Web Interface]
+    GeminiWeb -->|Web Response| Chromium
+    Chromium -->|Response & Thought Extraction| Pool
+    Pool -->|Data Return| FastAPI
+    FastAPI -->|Formatted OpenAI / STT Response| Client
 ```
 
-### 1. O Motor: Python + Playwright
-* **Inicialização do Browser**: Quando o servidor proxy é iniciado, o Python (via FastAPI) inicializa o `PlaywrightGeminiPool`. Este pool abre e gerencia instâncias otimizadas do navegador Chromium em segundo plano (modo *headless* por padrão).
-* **Automação do DOM (Document Object Model)**: O Playwright localiza os seletores específicos do chat do Gemini para:
-  1. Injetar a mensagem ou prompt do usuário no campo de entrada (`textarea`).
-  2. Anexar arquivos de mídia e imagens convertidas para base64.
-  3. Clicar no botão de envio de forma segura através do contexto de execução da página (`page.evaluate`).
-  4. Aguardar o processamento em tempo real (incluindo o suporte a streaming de tokens).
-* **Extração Inteligente de Conteúdo**: Assim que a resposta começa a ser gerada, seletores CSS customizados escaneiam a página para capturar o conteúdo produzido. O wrapper extrai separadamente o **texto limpo da resposta**, os **pensamentos/raciocínio (Extended Thinking)** e os metadados gerados, filtrando quaisquer resíduos visuais do painel web.
+### 1. The Engine: Python + Playwright
+* **Browser Initialization**: When the proxy server starts, Python (via FastAPI) initializes the `PlaywrightGeminiPool`. This pool opens and manages optimized Chromium browser instances in the background (headless mode by default).
+* **DOM (Document Object Model) Automation**: Playwright locates specific selectors on the Gemini chat page to:
+  1. Inject the user's message or prompt into the input field (`textarea`).
+  2. Attach media files and base64-converted images.
+  3. Click the send button safely through the page execution context (`page.evaluate`).
+  4. Wait for processing in real-time (including support for token streaming).
+* **Intelligent Content Extraction**: As soon as the response starts generating, custom CSS selectors scan the page to capture the produced content. The wrapper separately extracts the **clean response text**, the **thoughts/reasoning (Extended Thinking)**, and generated metadata, filtering out any visual residue from the web panel.
 
-### 2. O Wrapper e Proxy (FastAPI)
-O wrapper expõe rotas HTTP idênticas às das APIs oficiais da OpenAI e do Google:
-* **Compatibilidade com OpenAI Chat Completions** (`/v1beta/openai/chat/completions`): Traduz payloads JSON contendo histórico de chat (`messages`), diretrizes de sistema (`system_instruction`) e arquivos de mídia em comandos que o Playwright executa na página web do Gemini. Em seguida, formata o retorno como uma resposta padrão compatível com OpenAI.
-* **Compatibilidade com Google Speech-to-Text (STT)** (`/v1/speech:recognize`): Recebe áudio cru no formato PCM (LINEAR16), converte-o internamente para WAV usando Python e o envia ao Gemini em formato multimodal para obter a transcrição perfeita e veloz do áudio recebido.
+### 2. The Wrapper and Proxy (FastAPI)
+The wrapper exposes HTTP routes identical to those of the official OpenAI and Google APIs:
+* **Compatibility with OpenAI Chat Completions** (`/v1beta/openai/chat/completions`): Translates JSON payloads containing chat history (`messages`), system guidelines (`system_instruction`), and media files into commands that Playwright executes on the Gemini web page. It then formats the return as a standard OpenAI-compatible response.
+* **Compatibility with Google Speech-to-Text (STT)** (`/v1/speech:recognize`): Receives raw audio in PCM format (LINEAR16), converts it internally to WAV using Python, and sends it to Gemini in multimodal format to obtain a fast and perfect transcription of the received audio.
 
-### 3. Gerenciamento de Múltiplos Perfis (Multi-Profile)
-Para evitar que sua conta seja bloqueada por excesso de requisições e para permitir o uso de diferentes contas Google no mesmo servidor, o projeto conta com um sistema robusto de múltiplos perfis.
+### 3. Multi-Profile Management
+To prevent your account from being blocked due to excessive requests and to allow the use of different Google accounts on the same server, the project features a robust multi-profile system.
 
-* **Estrutura de Armazenamento**: Cada conta configurada possui seu próprio diretório em `profiles/`:
+* **Storage Structure**: Each configured account has its own directory under `profiles/`:
   ```text
   profiles/
-  ├── conta_pessoal/
-  │   └── cookies.json     # Cookies de sessão específicos desta conta
-  ├── conta_trabalho/
+  ├── personal_account/
+  │   └── cookies.json     # Account-specific session cookies
+  ├── work_account/
   │   └── cookies.json
   └── cookies/
-      └── cookies.json     # Perfil padrão
+      └── cookies.json     # Default profile
   ```
-* **Cookies de Sessão**: Os arquivos `cookies.json` armazenam os tokens essenciais de autenticação da Google (`__Secure-1PSID` e `__Secure-1PSIDTS`).
-* **Como Sincronizar Novos Perfis**:
-  O script `sync_cookies.py` permite que você crie e atualize os perfis de forma totalmente visual:
+* **Session Cookies**: The `cookies.json` files store essential Google authentication tokens (`__Secure-1PSID` and `__Secure-1PSIDTS`).
+* **How to Sync New Profiles**:
+  The `sync_cookies.py` script allows you to create and update profiles in a fully visual way:
   ```bash
-  python sync_cookies.py <nome_do_perfil> --login
+  python sync_cookies.py <profile_name> --login
   ```
-  Isso abrirá uma janela do navegador. Basta fazer login na conta Google desejada, acessar o Gemini e fechar o navegador. O script irá extrair e salvar os cookies válidos na pasta do perfil correspondente.
-* **Persistência de Perfil**: O arquivo local `.selected_profile` armazena qual perfil está ativo no momento, garantindo que o servidor utilize a conta correta a cada inicialização.
+  This will open a browser window. Simply log in to the desired Google account, navigate to Gemini, and close the browser. The script will extract and save valid cookies in the corresponding profile folder.
+* **Profile Persistence**: The local `.selected_profile` file stores which profile is currently active, ensuring that the server uses the correct account upon each startup.
 
 ---
 
-## 🛠️ Instalação e Configuração rápida
+## 🛠️ Quick Installation and Setup
 
-### Pré-requisitos
-* **Python 3.10 ou superior** instalado no seu sistema.
-* Uma conta Google activa.
+### Prerequisites
+* **Python 3.10 or higher** installed on your system.
+* An active Google account.
 
-### Instalação (Windows)
-Basta executar o script automatizado na raiz do projeto:
+### Installation (Windows)
+Just run the automated script in the project root:
 ```cmd
 setup_and_run.bat
 ```
-Este script cria o ambiente virtual (venv), instala todas as dependências do Python e do Playwright e inicia o menu interativo.
+This script creates the virtual environment (venv), installs all Python and Playwright dependencies, and starts the interactive menu.
 
-### Instalação Manual (Qualquer Sistema Operacional)
-1. Crie e ative um ambiente virtual Python:
+### Manual Installation (Any OS)
+1. Create and activate a Python virtual environment:
    ```bash
    python -m venv venv
-   source venv/bin/activate  # No Windows use: venv\Scripts\activate
+   source venv/bin/activate  # On Windows use: venv\Scripts\activate
    ```
-2. Instale o pacote no modo editável e instale as dependências:
+2. Install the package in editable mode and install dependencies:
    ```bash
    pip install -e .
    pip install fastapi uvicorn playwright pillow
    python -m playwright install chromium
    ```
 
-3. Configure o perfil de login (Substitua `<nome_perfil>` pelo nome que preferir):
+3. Configure the login profile (Replace `<profile_name>` with your preferred name):
    ```bash
-   python sync_cookies.py <nome_perfil> --login
+   python sync_cookies.py <profile_name> --login
    ```
-   *Faça login na janela do navegador que se abrirá, acesse o Gemini e feche a janela.*
+   *Log in to the browser window that opens, navigate to Gemini, and then close the window.*
 
-4. Selecione o perfil ativo:
+4. Select the active profile:
    ```bash
-   # O sistema utilizará o perfil salvo em .selected_profile
-   echo <nome_perfil> > .selected_profile
+   # The system will use the profile saved in .selected_profile
+   echo <profile_name> > .selected_profile
    ```
 
 ---
 
-## 🚀 Executando o Servidor Proxy
+## 🚀 Running the Proxy Server
 
-Para iniciar o servidor localmente:
+To start the server locally:
 ```bash
 python proxy_server.py
 ```
-O servidor FastAPI será iniciado e ficará ouvindo na porta local: `http://localhost:8000`.
+The FastAPI server will start and listen on the local port: `http://localhost:8000`.
 
-### Integração com Cursor / VS Code / Apps de IA
-Configure o seu cliente de inteligência artificial ou editor de código da seguinte forma:
+### Cursor / VS Code / AI Apps Integration
+Configure your AI client or code editor as follows:
 
 * **API URL / Base URL**: `http://localhost:8000/v1beta/openai`
-* **API Key / Chave**: Qualquer valor (ex: `sk-generic-key`)
-* **Modelo**: Qualquer nome (o proxy mapeará automaticamente para o modelo ativo selecionado no servidor).
+* **API Key**: Any value (e.g., `sk-generic-key`)
+* **Model**: Any name (the proxy will automatically map it to the active model selected on the server).
 
 ---
 
-## ⚖️ Licença
+## ⚖️ License
 
-Este projeto é distribuído sob a licença MIT. Consulte o arquivo `LICENSE` para obter mais detalhes.
+This project is distributed under the MIT License. See the `LICENSE` file for details.
