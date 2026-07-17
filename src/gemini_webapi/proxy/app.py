@@ -275,6 +275,7 @@ async def execute_gemini_request_with_retry(
             account_name = account["name"]
             masked_psid = mask_cookie(account["psid"])
             logger.info(f"Using account {idx}/{len(accounts)} ({account_name}) - PSID: {masked_psid}...")
+            sys.modules[__name__].last_used_account = f"{account_name} (PSID: {masked_psid})"
 
             # --- Attempt 1: Normal Chat Session ---
             gclient_class = GeminiClient
@@ -353,6 +354,7 @@ async def execute_gemini_request_with_retry(
 
             # --- Attempt 2: Simple Retry (New Clean Session on the same account) ---
             logger.info(f"Executing simple retry (Attempt 2) on account {account_name}...")
+            sys.modules[__name__].last_used_account = f"{account_name} (PSID: {masked_psid})"
             gclient_class = GeminiClient
             if "proxy_server" in sys.modules:
                 proxy_module = sys.modules["proxy_server"]
@@ -442,6 +444,7 @@ async def execute_gemini_stream_with_retry(
 
             client = GeminiClient(account["psid"], account["psidts"])
             client.thinking_level = get_thinking_value(request_thinking_level)
+            sys.modules[__name__].last_used_account = f"{account_name} (PSID: {mask_cookie(account.get('psid', ''))})"
 
             try:
                 await client.init(timeout=30)
@@ -593,7 +596,7 @@ async def proxy(path: str, request: Request):
     try:
         if "speech:recognize" in path:
             response = await handle_speech_recognition(request)
-        elif "openai/chat/completions" in path:
+        elif "openai/chat/completions" in path or "chat/completions" in path:
             response = await handle_openai_chat_completions(request)
         else:
             response = await handle_gemini_content(request)

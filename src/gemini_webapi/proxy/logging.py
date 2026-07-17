@@ -16,6 +16,11 @@ logger.setLevel(logging.INFO)
 
 # Console Handler
 if not logger.handlers:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(logging.Formatter(LOG_FORMAT))
     logger.addHandler(console_handler)
@@ -133,3 +138,95 @@ def save_transaction_log(
         prune_old_transactions()
     except Exception as e:
         logger.error(f"Error saving transaction log file: {e}", exc_info=True)
+
+
+def safe_console_print(text: str):
+    """Prints formatted text directly to console with encoding fallback for Windows cmd/powershell."""
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        try:
+            enc = getattr(sys.stdout, "encoding", "utf-8") or "utf-8"
+            clean_text = text.encode(enc, errors="replace").decode(enc, errors="replace")
+            print(clean_text, flush=True)
+        except Exception:
+            pass
+
+
+def get_last_used_account() -> str:
+    """Retrieves the last active account information from memory."""
+    try:
+        app_mod = sys.modules.get("gemini_webapi.proxy.app")
+        if app_mod and hasattr(app_mod, "last_used_account") and app_mod.last_used_account:
+            return app_mod.last_used_account
+    except Exception:
+        pass
+    return "API Wrapper (Padrão)"
+
+
+def log_request_to_console(
+    req_type: str,
+    model: str,
+    profile: str | None,
+    account_info: str | None,
+    prompt: str,
+    response_text: str,
+    status_code: int = 200,
+    elapsed_time: float = 0.0,
+    thoughts_text: str = ""
+):
+    """
+    Exibe um painel de log completo e detalhado diretamente no console interativo.
+    """
+    try:
+        now_str = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        
+        prompt_clean = (prompt or "").strip()
+        if len(prompt_clean) > 2500:
+            prompt_clean = prompt_clean[:2500] + "\n... [PROMPT TRUNCADO PARA EXIBIÇÃO NO CONSOLE]"
+            
+        resp_clean = (response_text or "").strip()
+        if len(resp_clean) > 2500:
+            resp_clean = resp_clean[:2500] + "\n... [RESPOSTA TRUNCADA PARA EXIBIÇÃO NO CONSOLE]"
+
+        thoughts_section = ""
+        if thoughts_text and thoughts_text.strip():
+            t_clean = thoughts_text.strip()
+            if len(t_clean) > 1200:
+                t_clean = t_clean[:1200] + "\n... [PENSAMENTOS TRUNCADOS]"
+            thoughts_section = f"[RACIOCÍNIO / THOUGHTS]:\n{t_clean}\n--------------------------------------------------------------------------------\n"
+
+        if not account_info:
+            account_info = get_last_used_account()
+
+        profile_display = profile if profile else "Padrão (Todas as contas / Default)"
+
+        lines = [
+            "",
+            "================================================================================",
+            f"[{now_str}] >>> LOG DE REQUISIÇÃO E RESPOSTA (CONSOLE) <<<",
+            "--------------------------------------------------------------------------------",
+            f"• DATA / HORA        : {now_str}",
+            f"• TIPO DE REQUISIÇÃO : {req_type}",
+            f"• PERFIL ATIVO       : {profile_display}",
+            f"• CONTA USADA        : {account_info}",
+            f"• MODELO ATIVO       : {model or 'Desconhecido'}",
+            f"• STATUS / TEMPO     : Status {status_code} | Tempo: {elapsed_time:.3f}s",
+            "--------------------------------------------------------------------------------",
+            "[MENSAGENS ENVIADAS / PROMPT]:",
+            prompt_clean if prompt_clean else "(Vazio ou Mídia/Áudio unicamente)",
+            "--------------------------------------------------------------------------------",
+            thoughts_section + "[RESPOSTA GERADA]:",
+            resp_clean if resp_clean else "(Sem conteúdo de resposta texto)",
+            "================================================================================",
+            ""
+        ]
+        
+        box_text = "\n".join(lines)
+        safe_console_print(box_text)
+        
+        # Also log a concise summary line for rotating file logs
+        logger.info(f"[Summary] {req_type} | Perfil: {profile_display} | Modelo: {model} | Status: {status_code} | Tempo: {elapsed_time:.3f}s")
+    except Exception as e:
+        logger.error(f"Erro ao exibir log de requisição no console: {e}")
+

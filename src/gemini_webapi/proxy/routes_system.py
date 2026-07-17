@@ -2,16 +2,18 @@ import os
 import base64
 import tempfile
 import asyncio
+import time
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from gemini_webapi.proxy.logging import logger
+from gemini_webapi.proxy.logging import logger, log_request_to_console
 
 
 async def handle_gemini_content(request: Request):
     """
     Handles requests in Google Gemini API native format (including inlineData for images).
     """
+    start_time = time.time()
     logger.info("New native Gemini content request received.")
     try:
         data = await request.json()
@@ -129,6 +131,7 @@ async def handle_gemini_content(request: Request):
 
     req_model = data.get("model")
     model_to_use = get_active_model()
+    model_display = f"{req_model} (Resolvido: {model_to_use})" if req_model and req_model != model_to_use else model_to_use
 
     request_thinking = None
     thinking_config = data.get("generationConfig", {}).get("thinkingConfig", {})
@@ -239,6 +242,16 @@ async def handle_gemini_content(request: Request):
             except asyncio.TimeoutError:
                 err_msg = "⚠️ Gemini proxy error: The gemini_webapi wrapper timed out."
                 logger.error(err_msg)
+                log_request_to_console(
+                    req_type="Gemini Content (Sync)",
+                    model=model_display,
+                    profile=get_active_profile(),
+                    account_info=None,
+                    prompt=prompt_text,
+                    response_text=err_msg,
+                    status_code=504,
+                    elapsed_time=time.time() - start_time
+                )
                 return JSONResponse(status_code=200, content={
                     "candidates": [
                         {
@@ -254,6 +267,16 @@ async def handle_gemini_content(request: Request):
             except Exception as e:
                 err_msg = f"⚠️ Gemini proxy error: Communication error in wrapper: {str(e)}"
                 logger.error(err_msg)
+                log_request_to_console(
+                    req_type="Gemini Content (Sync)",
+                    model=model_display,
+                    profile=get_active_profile(),
+                    account_info=None,
+                    prompt=prompt_text,
+                    response_text=err_msg,
+                    status_code=502,
+                    elapsed_time=time.time() - start_time
+                )
                 return JSONResponse(status_code=200, content={
                     "candidates": [
                         {
@@ -273,6 +296,18 @@ async def handle_gemini_content(request: Request):
                     os.remove(temp_path)
                 except Exception:
                     pass
+
+    account_used = f"Playwright -> {playwright_pool.active_account_name}" if pool_success else None
+    log_request_to_console(
+        req_type="Gemini Content (Sync)",
+        model=model_display,
+        profile=get_active_profile(),
+        account_info=account_used,
+        prompt=prompt_text,
+        response_text=response_text,
+        status_code=200,
+        elapsed_time=time.time() - start_time
+    )
 
     return JSONResponse(content={
         "candidates": [

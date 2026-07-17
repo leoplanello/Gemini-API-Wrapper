@@ -7,13 +7,14 @@ import asyncio
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from gemini_webapi.proxy.logging import logger
+from gemini_webapi.proxy.logging import logger, log_request_to_console
 
 
 async def handle_openai_chat_completions(request: Request):
     """
     Handles requests in OpenAI Chat Completions API format (sent by third-party apps).
     """
+    start_time = time.time()
     logger.info("New OpenAI Chat Completions request received.")
     try:
         data = await request.json()
@@ -163,6 +164,7 @@ async def handle_openai_chat_completions(request: Request):
     reasoning_effort = data.get("reasoning_effort")
 
     model_to_use = get_active_model()
+    model_display = f"{req_model} (Resolvido: {model_to_use})" if req_model and req_model != model_to_use else model_to_use
     request_thinking = None
     if reasoning_effort:
         request_thinking = str(reasoning_effort)
@@ -232,6 +234,8 @@ async def handle_openai_chat_completions(request: Request):
                     async def event_generator():
                         errors = []
                         stream_success = False
+                        streamed_text = ""
+                        stream_account = None
 
                         try:
                             initial_chunk = {
@@ -264,6 +268,7 @@ async def handle_openai_chat_completions(request: Request):
                                     if chunk == "":
                                         yield ": keep-alive\n\n"
                                         continue
+                                    streamed_text += chunk
                                     chunk_data = {
                                         "id": "chatcmpl-geminiproxy",
                                         "object": "chat.completion.chunk",
@@ -279,6 +284,7 @@ async def handle_openai_chat_completions(request: Request):
                                     }
                                     yield f"data: {json.dumps(chunk_data)}\n\n"
                                 stream_success = True
+                                stream_account = f"Playwright -> {account_to_use}"
                                 playwright_pool.active_account_name = account_to_use
                                 break
                             except (CaptchaError, LogoutError) as ce:
@@ -307,6 +313,7 @@ async def handle_openai_chat_completions(request: Request):
                                         if chunk == "":
                                             yield ": keep-alive\n\n"
                                             continue
+                                        streamed_text += chunk
                                         chunk_data = {
                                             "id": "chatcmpl-geminiproxy",
                                             "object": "chat.completion.chunk",
@@ -322,6 +329,7 @@ async def handle_openai_chat_completions(request: Request):
                                         }
                                         yield f"data: {json.dumps(chunk_data)}\n\n"
                                     stream_success = True
+                                    stream_account = f"Playwright -> {account_to_solve}"
                                     playwright_pool.active_account_name = account_to_solve
                                 except Exception as exc:
                                     logger.error(f"Failed again after solving: {exc}")
@@ -338,6 +346,7 @@ async def handle_openai_chat_completions(request: Request):
                                     request_thinking_level=request_thinking
                                 ):
                                     if chunk:
+                                        streamed_text += chunk
                                         chunk_data = {
                                             "id": "chatcmpl-geminiproxy",
                                             "object": "chat.completion.chunk",
@@ -353,12 +362,23 @@ async def handle_openai_chat_completions(request: Request):
                                         }
                                         yield f"data: {json.dumps(chunk_data)}\n\n"
                                 stream_success = True
+                                stream_account = None
                             except Exception as wrapper_exc:
                                 logger.error(f"Wrapper stream fallback failed: {wrapper_exc}")
                                 errors.append(wrapper_exc)
 
                         if not stream_success:
                             last_err = errors[-1] if errors else "No pre-warmed accounts available."
+                            log_request_to_console(
+                                req_type="OpenAI Chat (Streaming)",
+                                model=model_display,
+                                profile=get_active_profile(),
+                                account_info=stream_account,
+                                prompt=full_prompt,
+                                response_text=f"⚠️ Playwright pool error: {last_err}",
+                                status_code=500,
+                                elapsed_time=time.time() - start_time
+                            )
                             err_chunk = {
                                 "id": "chatcmpl-geminiproxy",
                                 "object": "chat.completion.chunk",
@@ -375,6 +395,16 @@ async def handle_openai_chat_completions(request: Request):
                             yield f"data: {json.dumps(err_chunk)}\n\n"
                             yield "data: [DONE]\n\n"
                         else:
+                            log_request_to_console(
+                                req_type="OpenAI Chat (Streaming)",
+                                model=model_display,
+                                profile=get_active_profile(),
+                                account_info=stream_account,
+                                prompt=full_prompt,
+                                response_text=streamed_text,
+                                status_code=200,
+                                elapsed_time=time.time() - start_time
+                            )
                             final_chunk = {
                                 "id": "chatcmpl-geminiproxy",
                                 "object": "chat.completion.chunk",
@@ -463,6 +493,7 @@ async def handle_openai_chat_completions(request: Request):
             if use_stream:
                 logger.info("No Playwright accounts available. Streaming via wrapper (execute_gemini_stream_with_retry)...")
                 async def wrapper_event_generator():
+                    streamed_text = ""
                     try:
                         initial_chunk = {
                             "id": "chatcmpl-geminiproxy",
@@ -479,6 +510,7 @@ async def handle_openai_chat_completions(request: Request):
                             request_thinking_level=request_thinking
                         ):
                             if chunk:
+                                streamed_text += chunk
                                 chunk_data = {
                                     "id": "chatcmpl-geminiproxy",
                                     "object": "chat.completion.chunk",
@@ -487,6 +519,16 @@ async def handle_openai_chat_completions(request: Request):
                                     "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]
                                 }
                                 yield f"data: {json.dumps(chunk_data)}\n\n"
+                        log_request_to_console(
+                            req_type="OpenAI Chat (Streaming)",
+                            model=model_display,
+                            profile=get_active_profile(),
+                            account_info=None,
+                            prompt=full_prompt,
+                            response_text=streamed_text,
+                            status_code=200,
+                            elapsed_time=time.time() - start_time
+                        )
                         final_chunk = {
                             "id": "chatcmpl-geminiproxy",
                             "object": "chat.completion.chunk",
@@ -520,6 +562,16 @@ async def handle_openai_chat_completions(request: Request):
             except asyncio.TimeoutError:
                 err_msg = "⚠️ Gemini proxy error: The gemini_webapi wrapper timed out."
                 logger.error(err_msg)
+                log_request_to_console(
+                    req_type="OpenAI Chat (Sync)",
+                    model=model_display,
+                    profile=get_active_profile(),
+                    account_info=None,
+                    prompt=full_prompt,
+                    response_text=err_msg,
+                    status_code=504,
+                    elapsed_time=time.time() - start_time
+                )
                 return JSONResponse(status_code=200, content={
                     "id": f"chatcmpl-geminiproxy-{int(time.time())}",
                     "object": "chat.completion",
@@ -534,6 +586,16 @@ async def handle_openai_chat_completions(request: Request):
             except Exception as e:
                 err_msg = f"⚠️ Gemini proxy error: Communication error in wrapper: {str(e)}"
                 logger.error(err_msg)
+                log_request_to_console(
+                    req_type="OpenAI Chat (Sync)",
+                    model=model_display,
+                    profile=get_active_profile(),
+                    account_info=None,
+                    prompt=full_prompt,
+                    response_text=err_msg,
+                    status_code=502,
+                    elapsed_time=time.time() - start_time
+                )
                 return JSONResponse(status_code=200, content={
                     "id": f"chatcmpl-geminiproxy-{int(time.time())}",
                     "object": "chat.completion",
@@ -553,6 +615,19 @@ async def handle_openai_chat_completions(request: Request):
                         os.remove(temp_path)
                     except Exception:
                         pass
+
+    account_used = f"Playwright -> {playwright_pool.active_account_name}" if pool_success else None
+    log_request_to_console(
+        req_type="OpenAI Chat (Sync)",
+        model=model_display,
+        profile=get_active_profile(),
+        account_info=account_used,
+        prompt=full_prompt,
+        response_text=response_text,
+        status_code=200,
+        elapsed_time=time.time() - start_time,
+        thoughts_text=thoughts_text
+    )
 
     message_payload = {
         "role": "assistant",

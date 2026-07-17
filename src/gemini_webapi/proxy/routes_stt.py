@@ -5,10 +5,11 @@ import tempfile
 import array
 import math
 import asyncio
+import time
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from gemini_webapi.proxy.logging import logger
+from gemini_webapi.proxy.logging import logger, log_request_to_console
 
 STT_REFUSAL_PATTERNS = [
     "não consigo ouvir",
@@ -76,6 +77,7 @@ async def handle_speech_recognition(request: Request):
     Handles requests in Google Speech-to-Text API format.
     Converts base64 LINEAR16 audio to a temporary WAV and transcribes it via Gemini.
     """
+    start_time = time.time()
     logger.info("New Speech-to-Text (STT) request received.")
     try:
         data = await request.json()
@@ -108,7 +110,7 @@ async def handle_speech_recognition(request: Request):
         return JSONResponse(status_code=400, content={"error": f"Failed to process audio data: {str(e)}"})
 
     # Import dynamically from app to avoid circular dependencies
-    from gemini_webapi.proxy.app import load_all_accounts, execute_gemini_request_with_retry, get_active_model
+    from gemini_webapi.proxy.app import load_all_accounts, execute_gemini_request_with_retry, get_active_model, get_active_profile
 
     if not load_all_accounts():
         return JSONResponse(status_code=500, content={"error": "No account or authentication cookie configured in profiles/ folder."})
@@ -130,9 +132,31 @@ async def handle_speech_recognition(request: Request):
         )
 
     except asyncio.TimeoutError:
-        return JSONResponse(status_code=504, content={"error": "Timeout exceeded during audio transcription."})
+        err_msg = "Timeout exceeded during audio transcription."
+        log_request_to_console(
+            req_type="Speech-to-Text (STT)",
+            model=get_active_model(),
+            profile=get_active_profile(),
+            account_info=None,
+            prompt="Transcrição de Áudio",
+            response_text=err_msg,
+            status_code=504,
+            elapsed_time=time.time() - start_time
+        )
+        return JSONResponse(status_code=504, content={"error": err_msg})
     except Exception as e:
-        return JSONResponse(status_code=502, content={"error": f"Error in transcription service: {str(e)}"})
+        err_msg = f"Error in transcription service: {str(e)}"
+        log_request_to_console(
+            req_type="Speech-to-Text (STT)",
+            model=get_active_model(),
+            profile=get_active_profile(),
+            account_info=None,
+            prompt="Transcrição de Áudio",
+            response_text=err_msg,
+            status_code=502,
+            elapsed_time=time.time() - start_time
+        )
+        return JSONResponse(status_code=502, content={"error": err_msg})
     finally:
         if temp_path and os.path.exists(temp_path):
             try:
@@ -155,6 +179,16 @@ async def handle_speech_recognition(request: Request):
         )
 
     # Retorna o JSON no padrão da Google Speech API
+    log_request_to_console(
+        req_type="Speech-to-Text (STT)",
+        model=get_active_model(),
+        profile=get_active_profile(),
+        account_info=None,
+        prompt="Transcrição de Áudio",
+        response_text=response_text_clean,
+        status_code=200,
+        elapsed_time=time.time() - start_time
+    )
     return JSONResponse(content={
         "results": [
             {
