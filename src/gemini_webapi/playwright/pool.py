@@ -9,6 +9,7 @@ from playwright.async_api import async_playwright
 
 from gemini_webapi.utils.profile_utils import (
     get_active_profile,
+    get_active_profiles,
     get_all_profiles,
     resolve_paths,
 )
@@ -28,14 +29,24 @@ if not logger.handlers:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s"))
     logger.addHandler(handler)
+    try:  # the proxy runs hidden, so keep pool activity in a file as well
+        import os as _os
+        from logging.handlers import RotatingFileHandler as _RFH
+        _logs_dir = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", "..", "..", "logs"))
+        _os.makedirs(_logs_dir, exist_ok=True)
+        _fh = _RFH(_os.path.join(_logs_dir, "pool.log"), maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8")
+        _fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s"))
+        logger.addHandler(_fh)
+    except Exception:
+        pass
 
 
 def get_all_accounts() -> list[dict]:
     """
-    Scans configured profiles directory to identify available accounts,
+    Scans configured profiles directory to identify active accounts for the pool,
     using shared profile utilities.
     """
-    profiles = get_all_profiles()
+    profiles = get_active_profiles()
     accounts = []
     for p in profiles:
         _, _, profile_path = resolve_paths(p)
@@ -44,6 +55,20 @@ def get_all_accounts() -> list[dict]:
             "profile_path": profile_path
         })
     return accounts
+
+
+
+# Upper bound for one response (was a fixed ~47s poll count, which returned "" while Gemini was still generating)
+_MAX_RESPONSE_WAIT_SEC = float(os.environ.get("GEMINI_MAX_WAIT_SEC", "240"))
+# Fast modes (flash/lite) normally show text within 3-5s; if nothing appears by then Gemini has stalled.
+_FAST_STALL_LIMIT_SEC = float(os.environ.get("GEMINI_FAST_STALL_SEC", "25"))
+_FAST_RETRY_MAX_SEC = float(os.environ.get("GEMINI_FAST_RETRY_MAX_SEC", "60"))
+_FAST_TEXT_IDLE_SEC = float(os.environ.get("GEMINI_FAST_IDLE_SEC", "6"))
+_SLOW_TEXT_IDLE_SEC = float(os.environ.get("GEMINI_SLOW_IDLE_SEC", "25"))
+
+
+class GenerationStall(Exception):
+    """Gemini kept 'generating' without producing any text for too long."""
 
 
 class PlaywrightGeminiPool:
@@ -56,6 +81,7 @@ class PlaywrightGeminiPool:
         self.active_account_name = None
         self.is_fresh_chat = {}  # account_name -> bool
         self.last_used_account = None
+        self.applied_mode = {}  # account_name -> (model_val, thinking_val) currently set in the Gemini UI
 
     def _locator(self, page, selector):
         """Helper to get a visibility-filtered locator or a standard one if mock."""
@@ -553,14 +579,21 @@ class PlaywrightGeminiPool:
 
         new_chat_selectors = [
             'a[href="/app"]',
-            'button[aria-label="New chat"]',
-            'button[aria-label="Nova conversa"]',
-            'a[aria-label="New chat"]',
-            'a[aria-label="Nova conversa"]',
-            'div[aria-label="New chat"]',
-            'div[aria-label="Nova conversa"]',
-            'button:has-text("New chat")',
+            'a[href*="gemini.google.com/app"]',
+            'button[aria-label*="Nova conversa"]',
+            'button[aria-label*="New chat"]',
+            'button[aria-label*="Novo bate-papo"]',
+            'button[aria-label*="Chat novo"]',
+            'a[aria-label*="Nova conversa"]',
+            'a[aria-label*="New chat"]',
+            'div[aria-label*="Nova conversa"]',
+            'div[aria-label*="New chat"]',
             'button:has-text("Nova conversa")',
+            'button:has-text("New chat")',
+            '.new-chat-button',
+            'side-nav-button',
+            'chat-window-header button[aria-label*="Nova conversa"]',
+            'chat-window-header button[aria-label*="New chat"]',
         ]
 
         for sel in new_chat_selectors:
@@ -569,15 +602,73 @@ class PlaywrightGeminiPool:
                 if await locator.count() > 0 and await locator.first.is_visible():
                     logger.info(f"[PlaywrightPool] [{account_name}] Clicking New Chat button via: {sel}")
                     await locator.first.click(timeout=3000)
-                    await page.wait_for_timeout(500)
-                    current_url = page.url or ""
-                    if "gemini.google.com/app" in current_url and "/c/" not in current_url:
-                        logger.info(f"[PlaywrightPool] [{account_name}] Successfully started new chat via click.")
-                        return True
+                    for _ in range(15):
+                        await page.wait_for_timeout(200)
+                        current_url = page.url or ""
+                        if "gemini.google.com/app" in current_url and "/c/" not in current_url:
+                            logger.info(f"[PlaywrightPool] [{account_name}] Successfully started new chat via click.")
+                            return True
             except Exception as e:
                 logger.debug(f"[PlaywrightPool] [{account_name}] Selector '{sel}' failed for new chat: {e}")
 
         return False
+
+    @staticmethod
+    def _kill_profile_processes(profile_path: str):
+        """Safely terminate any orphaned Chromium processes locked to this specific profile path."""
+        try:
+            norm_path = os.path.normpath(profile_path)
+            if sys.platform == "win32":
+                import subprocess
+                clean_dir = norm_path.replace("'", "''")
+                ps_cmd = (
+                    f"Get-CimInstance Win32_Process | "
+                    f"Where-Object {{ ($_.ProcessName -like '*chrome*' -or $_.ProcessName -like '*msedge*') -and $_.CommandLine -like '*{clean_dir}*' }} | "
+                    f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+                )
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                    capture_output=True,
+                    timeout=8
+                )
+            else:
+                import subprocess
+                subprocess.run(["pkill", "-f", norm_path], capture_output=True, timeout=5)
+        except Exception as e:
+            logger.debug(f"[PlaywrightPool] Error cleaning up orphaned profile processes: {e}")
+
+    async def _launch_persistent_context_safely(
+        self,
+        profile_path: str,
+        headless: bool,
+        args: list,
+        account_name: str,
+    ):
+        """
+        Launches a persistent browser context with automatic cleanup of orphaned
+        Chromium processes and single retry if profile lock / existing session collision is detected.
+        """
+        launch_kwargs = dict(
+            user_data_dir=profile_path,
+            headless=headless,
+            channel="chrome" if os.name == "nt" else None,
+            args=args,
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
+        try:
+            return await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception as launch_err:
+            err_msg = str(launch_err).lower()
+            if "existing browser session" in err_msg or "already in use" in err_msg or "singletonlock" in err_msg:
+                logger.warning(
+                    f"[PlaywrightPool] Account '{account_name}' profile locked by existing/orphaned Chromium session. "
+                    f"Cleaning up orphaned processes for '{profile_path}' and retrying..."
+                )
+                self._kill_profile_processes(profile_path)
+                await asyncio.sleep(1.5)
+                return await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+            raise
 
     async def start_pool(self, headless: bool = True):
         self.headless = headless
@@ -608,13 +699,11 @@ class PlaywrightGeminiPool:
 
             logger.info(f"[PlaywrightPool] Pre-warming '{name}' in '{profile_path}'...")
             try:
-                context = await self.playwright.chromium.launch_persistent_context(
-                    user_data_dir=profile_path,
+                context = await self._launch_persistent_context_safely(
+                    profile_path=profile_path,
                     headless=headless,
-                    channel="chrome" if os.name == "nt" else None,
                     args=launch_args,
-                    viewport={"width": 1280, "height": 800},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    account_name=name,
                 )
 
                 page = await context.new_page()
@@ -672,11 +761,22 @@ class PlaywrightGeminiPool:
 
             logger.info(f"[PlaywrightPool] [{account_name}] Resetting chat to fresh state in background...")
             try:
-                await page.goto("https://gemini.google.com/app", timeout=45000)
-                await page.wait_for_timeout(2000)
+                success = await self._trigger_new_chat(page, account_name)
+                if not success:
+                    await page.goto("https://gemini.google.com/app", timeout=45000)
+                # wait until the new chat is actually empty and ready (instead of a fixed 1s sleep)
+                for _ in range(30):
+                    try:
+                        if await self._locator(page, _RESPONSE_SELECTOR).count() == 0 and await page.locator(_INPUT_SELECTOR).count() > 0:
+                            break
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(50)
                 status = await self.check_page_status(page, account_name)
                 if status == "ok":
-                    await self._ensure_model_and_thinking(page, account_name)
+                    # keep the mode the last request used; skip the menu round-trip if already applied
+                    prev_model, prev_thinking = self.applied_mode.get(account_name) or (None, None)
+                    await self._ensure_mode_for_request(page, account_name, prev_model, prev_thinking)
                     self.is_fresh_chat[account_name] = True
                     logger.info(f"[PlaywrightPool] [{account_name}] Background reset complete. Marked as fresh chat.")
                 else:
@@ -981,7 +1081,9 @@ class PlaywrightGeminiPool:
 
         return False
 
-    async def _ensure_model_and_thinking(self, page, account_name: str):
+    @staticmethod
+    def _resolve_mode(account_name: str = "", model_override: str = None, thinking_override: str = None) -> tuple[str, str]:
+        """Effective (model, thinking): per-request override first, then the shared .selected_* files."""
         model_val = "gemini-3-flash"
         thinking_val = "Standard"
 
@@ -1002,6 +1104,23 @@ class PlaywrightGeminiPool:
                         thinking_val = val
             except Exception as e:
                 logger.warning(f"[PlaywrightPool] [{account_name}] Failed to read .thinking_level: {e}")
+
+        if model_override:
+            model_val = model_override.strip()
+        if thinking_override:
+            thinking_val = thinking_override.strip()
+        return model_val, thinking_val
+
+    async def _ensure_mode_for_request(self, page, account_name: str, model_override: str = None, thinking_override: str = None, force: bool = False):
+        """Apply the model/thinking mode only when it differs from what the page already has."""
+        wanted = self._resolve_mode(account_name, model_override, thinking_override)
+        if not force and self.applied_mode.get(account_name) == wanted:
+            return
+        await self._ensure_model_and_thinking(page, account_name, model_override, thinking_override)
+
+    async def _ensure_model_and_thinking(self, page, account_name: str, model_override: str = None, thinking_override: str = None):
+        model_val, thinking_val = self._resolve_mode(account_name, model_override, thinking_override)
+        self.applied_mode[account_name] = (model_val, thinking_val)
 
         flash_ids = ["56fdd199312815e2", "fbb127bbb056c959"]
         pro_ids = ["e6fa609c3fa255c0", "9d8ca3786ebdfbea"]
@@ -1028,6 +1147,7 @@ class PlaywrightGeminiPool:
             selector_btn = page.locator("button.input-area-switch, button[aria-label*='seletor de modo'], button[aria-label*='mode selector']")
             if await selector_btn.count() == 0:
                 logger.warning(f"[PlaywrightPool] [{account_name}] Model selector button not found.")
+                self.applied_mode.pop(account_name, None)
                 return
 
             await self._human_click(page, selector_btn.first)
@@ -1140,6 +1260,7 @@ class PlaywrightGeminiPool:
                 await page.wait_for_timeout(300)
 
         except Exception as e:
+            self.applied_mode.pop(account_name, None)
             logger.error(f"[PlaywrightPool] [{account_name}] Error ensuring model/thinking level: {e}", exc_info=True)
             try:
                 await page.keyboard.press("Escape")
@@ -1157,11 +1278,69 @@ class PlaywrightGeminiPool:
                 continue
         return _RESPONSE_SELECTOR
 
-    async def send_message(self, account_name: str, prompt: str, files: list[str] = None, clean_prompt: str = None, force_new_chat: bool = False) -> tuple[str, str]:
+    async def _log_empty_response_diagnostics(self, page, account_name: str, selector: str, initial_count: int):
+        """Called when the read loop gave up without any text: record what the page looked like."""
+        try:
+            info = await page.evaluate("""(sel) => {
+                const els = Array.from(document.querySelectorAll(sel));
+                const last = els[els.length - 1];
+                return {
+                    url: location.href, title: document.title, count: els.length,
+                    lastText: last ? (last.innerText || '').slice(0, 300) : null,
+                    lastHtml: last ? last.outerHTML.slice(0, 600) : null,
+                    generating: !!document.querySelector('button[aria-label*="Stop" i], button[aria-label*="Parar" i]'),
+                    buttons: Array.from(document.querySelectorAll('button, [role="button"]')).filter(b => b.offsetWidth > 0 || b.offsetHeight > 0).map(b => (b.getAttribute('aria-label') || b.getAttribute('data-test-id') || b.innerText || '').trim().slice(0, 40)).filter(Boolean).slice(-40),
+                    body: (document.body.innerText || '').slice(-400),
+                };
+            }""", selector)
+            logger.warning(f"[PlaywrightPool] [{account_name}] Empty response (initial_count={initial_count}). Page state: {info}")
+            shot = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "logs", "empty_response.png"))
+            await page.screenshot(path=shot)
+            logger.warning(f"[PlaywrightPool] [{account_name}] Screenshot saved to {shot}")
+        except Exception as e:
+            logger.warning(f"[PlaywrightPool] [{account_name}] Could not collect empty-response diagnostics: {e}")
+
+    @staticmethod
+    def _log_timing(account_name: str, tm: dict):
+        keys = ["start", "ready", "typed", "sent", "first_text", "done"]
+        parts, prev = [], tm.get("start")
+        for k in keys[1:]:
+            if k in tm and prev is not None:
+                parts.append(f"{k}=+{tm[k] - prev:.1f}s")
+                prev = tm[k]
+        logger.info(f"[PlaywrightPool] [{account_name}] [Timing] " + " ".join(parts) + f" total={tm.get('done', time.time()) - tm['start']:.1f}s")
+
+    async def send_message(self, account_name: str, prompt: str, files: list[str] = None, clean_prompt: str = None,
+                           force_new_chat: bool = False, continue_chat: bool = False, open_new_chat_after: bool = True,
+                           model_override: str = None, thinking_override: str = None) -> tuple[str, str]:
+        kwargs = dict(files=files, clean_prompt=clean_prompt, force_new_chat=force_new_chat, continue_chat=continue_chat,
+                      open_new_chat_after=open_new_chat_after, model_override=model_override, thinking_override=thinking_override)
+        try:
+            return await self._send_message_once(account_name, prompt, **kwargs)
+        except GenerationStall:
+            logger.warning(f"[PlaywrightPool] [{account_name}] Gemini stalled with no text; retrying once in a fresh chat.")
+            await self.reset_account_chat(account_name)
+            kwargs.update(force_new_chat=True, continue_chat=False)
+            return await self._send_message_once(account_name, prompt, _allow_stall=False, **kwargs)
+
+    async def _send_message_once(
+        self,
+        account_name: str,
+        prompt: str,
+        files: list[str] = None,
+        clean_prompt: str = None,
+        force_new_chat: bool = False,
+        continue_chat: bool = False,
+        open_new_chat_after: bool = True,
+        model_override: str = None,
+        thinking_override: str = None,
+        _allow_stall: bool = True,
+    ) -> tuple[str, str]:
         if account_name not in self.locks:
             raise ValueError(f"Account '{account_name}' not configured in the pool.")
 
         async with self.locks[account_name]:
+            _tm = {'start': time.time()}
             page = self.pages.get(account_name)
             if not page:
                 raise RuntimeError(f"Account '{account_name}' does not have an active page in the pool.")
@@ -1175,6 +1354,9 @@ class PlaywrightGeminiPool:
             if not is_on_gemini:
                 should_navigate = True
                 logger.info(f"[PlaywrightPool] [{account_name}] Current URL '{current_url}' is not on Gemini Web. Navigating to start a new chat...")
+            elif continue_chat and not profile_changed:
+                should_navigate = False
+                logger.info(f"[PlaywrightPool] [{account_name}] Continuing chat in existing session...")
             elif force_new_chat and not is_fresh:
                 should_navigate = True
                 logger.info(f"[PlaywrightPool] [{account_name}] force_new_chat requested for an existing session. Navigating to start a new chat...")
@@ -1206,8 +1388,11 @@ class PlaywrightGeminiPool:
                 raise LogoutError(f"Account '{account_name}' is logged out")
 
             if should_navigate:
-                await self._ensure_model_and_thinking(page, account_name)
+                await self._ensure_mode_for_request(page, account_name, model_override, thinking_override, force=True)
+            elif is_fresh:
+                await self._ensure_mode_for_request(page, account_name, model_override, thinking_override)
 
+            _tm['ready'] = time.time()
             prompt_to_send = prompt
             if not is_fresh and clean_prompt:
                 prompt_to_send = clean_prompt
@@ -1220,6 +1405,7 @@ class PlaywrightGeminiPool:
             await self._human_click(page, input_locator)
             await page.wait_for_timeout(50)
             await input_locator.fill(prompt_to_send)
+            _tm['typed'] = time.time()
             eval_res = input_locator.evaluate("el => el.dispatchEvent(new Event('input', { bubbles: true }))")
             if hasattr(eval_res, "__await__"):
                 await eval_res
@@ -1322,15 +1508,29 @@ class PlaywrightGeminiPool:
             if not is_mock and not gen_started:
                 logger.warning(f"[PlaywrightPool] [{account_name}] Generation may not have started after 3 send attempts.")
 
+            _tm['sent'] = time.time()
             self.is_fresh_chat[account_name] = False
             self.last_used_account = account_name
 
-            await page.wait_for_selector(_RESPONSE_SELECTOR, timeout=45000)
+            await page.wait_for_selector(_RESPONSE_SELECTOR, timeout=int(_MAX_RESPONSE_WAIT_SEC * 1000))
             active_response_selector = await self._detect_response_selector(page)
 
             last_text = ""
             stable_count = 0
-            for loop_idx in range(1200):
+            _mode_model = (self.applied_mode.get(account_name) or ("", ""))[0].lower()
+            _is_fast = "flash" in _mode_model or "lite" in _mode_model or any(x in _mode_model for x in ("fbb127bbb056c959", "56fdd199312815e2", "8c46e95b1a07cecc"))
+            _stall_limit = _FAST_STALL_LIMIT_SEC if (_allow_stall and _is_fast and "pro" not in _mode_model and "thinking" not in _mode_model) else 0
+            # If Gemini keeps reporting 'generating' but the text stopped changing, the answer is complete.
+            _text_idle_limit = _FAST_TEXT_IDLE_SEC if (_is_fast and "pro" not in _mode_model and "thinking" not in _mode_model) else _SLOW_TEXT_IDLE_SEC
+            _last_seen_text, _last_change = "", time.time()
+            # fast-mode retry (after a stall) gets a short leash instead of the full wait
+            _wait_cap = _FAST_RETRY_MAX_SEC if (_is_fast and not _allow_stall and "pro" not in _mode_model and "thinking" not in _mode_model) else _MAX_RESPONSE_WAIT_SEC
+            _deadline = time.time() + _wait_cap
+            for loop_idx in range(10**7):
+                if time.time() > _deadline:
+                    break
+                if _stall_limit and 'first_text' not in _tm and time.time() - _tm['sent'] > _stall_limit:
+                    raise GenerationStall()
                 if getattr(page, "captcha_detected", False):
                     raise CaptchaError(f"CAPTCHA detected for account '{account_name}'")
                 if loop_idx % 40 == 0:
@@ -1352,18 +1552,41 @@ class PlaywrightGeminiPool:
                     continue
 
                 current_text, thoughts_text, has_copy = await self._extract_last_valid_response(elements)
+                if current_text and 'first_text' not in _tm:
+                    _tm['first_text'] = time.time()
                 if not current_text:
                     await asyncio.sleep(0.025)
                     continue
 
                 is_generating = await self._is_generating(page)
 
+                if current_text != _last_seen_text:
+                    _last_seen_text, _last_change = current_text, time.time()
+                elif current_text and time.time() - _last_change > _text_idle_limit:
+                    logger.warning(f"[PlaywrightPool] [{account_name}] Text unchanged for {_text_idle_limit:.0f}s while page still reports 'generating'; treating answer as complete.")
+                    _tm['done'] = time.time(); self._log_timing(account_name, _tm)
+                    if open_new_chat_after:
+                        asyncio.create_task(self.reset_account_chat(account_name))
+                    return current_text, thoughts_text
+
+                if is_generating and current_text and loop_idx == 300:
+                    logger.warning(f"[PlaywrightPool] [{account_name}] Text present but page still reports 'generating' after ~{loop_idx} polls (has_copy={has_copy}, text={current_text[:60]!r}).")
+                    await self._log_empty_response_diagnostics(page, account_name, active_response_selector, initial_count)
+
                 if has_copy and not is_generating and current_text:
+                    if open_new_chat_after:
+                        logger.info(f"[PlaywrightPool] [{account_name}] Opening new chat after generation...")
+                        asyncio.create_task(self.reset_account_chat(account_name))
+                    _tm['done'] = time.time(); self._log_timing(account_name, _tm)
                     return current_text, thoughts_text
                 elif not is_generating and current_text:
                     if current_text == last_text:
                         stable_count += 1
                         if stable_count >= 80:
+                            if open_new_chat_after:
+                                logger.info(f"[PlaywrightPool] [{account_name}] Opening new chat after generation...")
+                                asyncio.create_task(self.reset_account_chat(account_name))
+                            _tm['done'] = time.time(); self._log_timing(account_name, _tm)
                             return current_text, thoughts_text
                     else:
                         stable_count = 0
@@ -1376,9 +1599,25 @@ class PlaywrightGeminiPool:
 
             elements = self._locator(page, active_response_selector)
             response_text, thoughts_text, _ = await self._extract_last_valid_response(elements)
+            if not response_text:
+                await self._log_empty_response_diagnostics(page, account_name, active_response_selector, initial_count)
+            if open_new_chat_after:
+                logger.info(f"[PlaywrightPool] [{account_name}] Opening new chat after generation...")
+                asyncio.create_task(self.reset_account_chat(account_name))
             return response_text, thoughts_text
 
-    async def send_message_stream(self, account_name: str, prompt: str, files: list[str] = None, clean_prompt: str = None, force_new_chat: bool = False):
+    async def send_message_stream(
+        self,
+        account_name: str,
+        prompt: str,
+        files: list[str] = None,
+        clean_prompt: str = None,
+        force_new_chat: bool = False,
+        continue_chat: bool = False,
+        open_new_chat_after: bool = True,
+        model_override: str = None,
+        thinking_override: str = None,
+    ):
         if account_name not in self.locks:
             raise ValueError(f"Account '{account_name}' not configured in the pool.")
 
@@ -1396,6 +1635,9 @@ class PlaywrightGeminiPool:
             if not is_on_gemini:
                 should_navigate = True
                 logger.info(f"[PlaywrightPool] [{account_name}] (Stream) Current URL '{current_url}' is not on Gemini Web. Navigating to start a new chat...")
+            elif continue_chat and not profile_changed:
+                should_navigate = False
+                logger.info(f"[PlaywrightPool] [{account_name}] (Stream) Continuing chat in existing session...")
             elif force_new_chat and not is_fresh:
                 should_navigate = True
                 logger.info(f"[PlaywrightPool] [{account_name}] (Stream) force_new_chat requested for an existing session. Navigating to start a new chat...")
@@ -1432,7 +1674,10 @@ class PlaywrightGeminiPool:
                 raise LogoutError(f"Account '{account_name}' is logged out")
 
             if should_navigate:
-                await self._ensure_model_and_thinking(page, account_name)
+                await self._ensure_mode_for_request(page, account_name, model_override, thinking_override, force=True)
+                yield ""
+            elif is_fresh:
+                await self._ensure_mode_for_request(page, account_name, model_override, thinking_override)
                 yield ""
 
             prompt_to_send = prompt
@@ -1581,7 +1826,10 @@ class PlaywrightGeminiPool:
             stable_count = 0
             last_text = ""
 
-            for loop_idx in range(2400):
+            _deadline = time.time() + _MAX_RESPONSE_WAIT_SEC
+            for loop_idx in range(10**7):
+                if time.time() > _deadline:
+                    break
                 if getattr(page, "captcha_detected", False):
                     raise CaptchaError(f"CAPTCHA detected for account '{account_name}'")
                 if loop_idx % 80 == 0:
@@ -1632,6 +1880,10 @@ class PlaywrightGeminiPool:
 
                 await asyncio.sleep(0.025)
 
+            if open_new_chat_after:
+                logger.info(f"[PlaywrightPool] [{account_name}] (Stream) Opening new chat after generation...")
+                asyncio.create_task(self.reset_account_chat(account_name))
+
     def _setup_page_listeners(self, page, name: str):
         page.captcha_detected = False
 
@@ -1674,7 +1926,7 @@ class PlaywrightGeminiPool:
         print("\n" + "=" * 80)
         print(f"[!] [MANUAL INTERVENTION REQUIRED] CAPTCHA or Login required for account '{account_name}'!")
         print("A visual browser window is opening. Please solve the CAPTCHA or log in.")
-        print("Once you log in and the Gemini chat input box loads, this window will close automatically.")
+        print("Once you log in and the Gemini chat input box loads, please close the Chrome browser window manually.")
         print("=" * 80 + "\n")
 
         if account_name in self.browsers:
@@ -1693,13 +1945,11 @@ class PlaywrightGeminiPool:
 
         solved = False
         try:
-            headed_context = await self.playwright.chromium.launch_persistent_context(
-                user_data_dir=profile_path,
+            headed_context = await self._launch_persistent_context_safely(
+                profile_path=profile_path,
                 headless=False,
-                channel="chrome" if os.name == "nt" else None,
                 args=launch_args,
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                account_name=account_name,
             )
 
             page = await headed_context.new_page()
@@ -1736,6 +1986,12 @@ class PlaywrightGeminiPool:
                             with open(cookie_path, "w", encoding="utf-8") as f:
                                 json.dump(cookie_data, f, indent=2)
                             logger.info(f"[PlaywrightPool] [SESSION/CAPTCHA] Saved updated cookies to cookies.json")
+                            print("\n" + "=" * 80)
+                            print(f"[SUCCESS] Login/CAPTCHA verified for '{account_name}'! Session cookies saved.")
+                            print("[ACTION REQUIRED] Please close the Chrome browser window manually to proceed.")
+                            print("=" * 80 + "\n")
+                            while not (page.is_closed() or len(headed_context.pages) == 0):
+                                await asyncio.sleep(1)
                             break
                         else:
                             logger.warning(f"[PlaywrightPool] [SESSION/CAPTCHA] Input area found but session cookies (__Secure-1PSID/__Secure-1PSIDTS) are missing. Still waiting...")
@@ -1751,13 +2007,11 @@ class PlaywrightGeminiPool:
         if solved:
             logger.info(f"[PlaywrightPool] Re-warming account '{account_name}' (headless={self.headless})...")
             try:
-                context = await self.playwright.chromium.launch_persistent_context(
-                    user_data_dir=profile_path,
+                context = await self._launch_persistent_context_safely(
+                    profile_path=profile_path,
                     headless=self.headless,
-                    channel="chrome" if os.name == "nt" else None,
                     args=launch_args,
-                    viewport={"width": 1280, "height": 800},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    account_name=account_name,
                 )
 
                 page = await context.new_page()

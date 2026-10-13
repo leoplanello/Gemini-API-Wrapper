@@ -1,0 +1,4 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_CURRENT_USER\Software\Policies\Microsoftdge\WebView2\AdditionalBrowserArguments]
+"WhatsApp.Root.exe"="--remote-debugging-port=9444 --remote-debugging-address=127.0.0.1"

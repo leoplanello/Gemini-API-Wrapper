@@ -10,6 +10,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from gemini_webapi.proxy.logging import logger, log_request_to_console
 
 
+_EXPLICIT_MODEL_ALIASES = {
+    "flash": "flash", "gemini-flash": "flash", "gemini-3-flash": "flash",
+    "lite": "lite", "gemini-lite": "lite", "gemini-flash-lite": "lite", "gemini-3-flash-lite": "lite",
+    "pro": "pro", "gemini-pro": "pro", "gemini-3-pro": "pro",
+}
+
+
 async def handle_openai_chat_completions(request: Request):
     """
     Handles requests in OpenAI Chat Completions API format (sent by third-party apps).
@@ -165,6 +172,13 @@ async def handle_openai_chat_completions(request: Request):
 
     model_to_use = get_active_model()
     model_display = f"{req_model} (Resolvido: {model_to_use})" if req_model and req_model != model_to_use else model_to_use
+    # Opt-in per-request mode (e.g. Pluely sends "x-gemini-model: flash"); without it the shared .selected_* config applies.
+    model_override = request.headers.get("x-gemini-model") or data.get("gemini_model")
+    if not model_override and str(req_model or "").strip().lower() in _EXPLICIT_MODEL_ALIASES:
+        # Clients that only expose a "model" field (e.g. Pluely) can pick the mode with an explicit alias.
+        # Other names (e.g. Auto-Job's "gemini-3.5-thinking") keep using the shared .selected_* config.
+        model_override = _EXPLICIT_MODEL_ALIASES[str(req_model).strip().lower()]
+    thinking_override = request.headers.get("x-gemini-thinking") or data.get("gemini_thinking")
     request_thinking = None
     if reasoning_effort:
         request_thinking = str(reasoning_effort)
@@ -188,7 +202,14 @@ async def handle_openai_chat_completions(request: Request):
                         clean_prompt = " ".join(parts).strip()
                     break
 
-        force_new_chat = (len(conversation_turns) <= 1)
+        # Determine whether to continue the conversation in the current chat or open new chat
+        header_continue = request.headers.get("x-continue-chat", "").strip().lower() in ["1", "true", "yes"]
+        body_continue = bool(data.get("continue_chat", False))
+        is_multiturn = (len(conversation_turns) > 1)
+
+        continue_chat = header_continue or body_continue or is_multiturn
+        force_new_chat = not continue_chat
+        open_new_chat_after = not continue_chat
 
         use_stream = data.get("stream", False)
         response_text = ""
@@ -263,7 +284,11 @@ async def handle_openai_chat_completions(request: Request):
                                     full_prompt,
                                     temp_files if temp_files else None,
                                     clean_prompt=clean_prompt,
-                                    force_new_chat=force_new_chat
+                                    force_new_chat=force_new_chat,
+                                    continue_chat=continue_chat,
+                                    open_new_chat_after=open_new_chat_after,
+                                    model_override=model_override,
+                                    thinking_override=thinking_override,
                                 ):
                                     if chunk == "":
                                         yield ": keep-alive\n\n"
@@ -308,7 +333,11 @@ async def handle_openai_chat_completions(request: Request):
                                         full_prompt,
                                         temp_files if temp_files else None,
                                         clean_prompt=clean_prompt,
-                                        force_new_chat=force_new_chat
+                                        force_new_chat=force_new_chat,
+                                        continue_chat=continue_chat,
+                                        open_new_chat_after=open_new_chat_after,
+                                        model_override=model_override,
+                                        thinking_override=thinking_override,
                                     ):
                                         if chunk == "":
                                             yield ": keep-alive\n\n"
@@ -449,7 +478,11 @@ async def handle_openai_chat_completions(request: Request):
                                 full_prompt,
                                 temp_files if temp_files else None,
                                 clean_prompt=clean_prompt,
-                                force_new_chat=force_new_chat
+                                force_new_chat=force_new_chat,
+                                continue_chat=continue_chat,
+                                open_new_chat_after=open_new_chat_after,
+                                model_override=model_override,
+                                thinking_override=thinking_override,
                             )
                             pool_success = True
                             playwright_pool.active_account_name = account_to_use
@@ -475,7 +508,11 @@ async def handle_openai_chat_completions(request: Request):
                                     full_prompt,
                                     temp_files if temp_files else None,
                                     clean_prompt=clean_prompt,
-                                    force_new_chat=force_new_chat
+                                    force_new_chat=force_new_chat,
+                                    continue_chat=continue_chat,
+                                    open_new_chat_after=open_new_chat_after,
+                                    model_override=model_override,
+                                    thinking_override=thinking_override,
                                 )
                                 pool_success = True
                                 playwright_pool.active_account_name = account_to_solve

@@ -3,7 +3,7 @@ import re
 import reprlib
 from typing import Any
 
-import orjson as json
+from gemini_webapi.compat_json import json
 
 from .logger import logger
 

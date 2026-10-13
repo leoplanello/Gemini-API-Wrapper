@@ -1,4 +1,4 @@
-import orjson as json
+from gemini_webapi.compat_json import json
 from pydantic import BaseModel
 
 from ..constants import build_model_header, MODEL_HEADER_KEY, Model
