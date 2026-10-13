@@ -1,7 +1,7 @@
 import re
 from enum import Enum, IntEnum, StrEnum
 
-import orjson as json
+from gemini_webapi.compat_json import json
 
 STREAMING_FLAG_INDEX = 7
 GEM_FLAG_INDEX = 19
@@ -167,6 +167,11 @@ class Model(Enum):
     def from_name(cls, name: str) -> "Model":
         for model in cls:
             if model.model_name == name:
+                return model
+
+        # .selected_model stores the internal model id, so accept that as well
+        for model in cls:
+            if model.model_id and model.model_id == name:
                 return model
 
         raise ValueError(

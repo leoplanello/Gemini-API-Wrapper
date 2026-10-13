@@ -3,7 +3,7 @@ import tempfile
 import time
 from pathlib import Path
 
-import orjson as json
+from gemini_webapi.compat_json import json
 from curl_cffi.requests import AsyncSession, Cookies
 
 from .logger import logger

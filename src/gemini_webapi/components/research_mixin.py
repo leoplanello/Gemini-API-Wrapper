@@ -3,7 +3,7 @@ import time
 from textwrap import shorten
 from typing import TYPE_CHECKING, Callable, Optional
 
-import orjson as json
+from gemini_webapi.compat_json import json
 
 from ..constants import GRPC, Model
 from ..exceptions import (

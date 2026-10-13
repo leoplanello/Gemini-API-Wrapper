@@ -9,7 +9,7 @@ from asyncio import Task
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
-import orjson as json
+from .compat_json import json
 from curl_cffi.requests import AsyncSession, Cookies, Response
 from curl_cffi.requests.exceptions import ReadTimeout
 

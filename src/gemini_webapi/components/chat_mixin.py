@@ -1,4 +1,4 @@
-import orjson as json
+from gemini_webapi.compat_json import json
 
 from ..constants import GRPC
 from ..types import (

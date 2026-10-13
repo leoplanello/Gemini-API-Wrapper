@@ -15,6 +15,7 @@ from gemini_webapi.exceptions import AuthError
 from gemini_webapi.constants import AccountStatus
 from gemini_webapi.utils.profile_utils import (
     get_active_profile,
+    get_active_profiles,
     get_all_profiles,
     resolve_paths,
     load_cookies_from_json,
@@ -22,6 +23,7 @@ from gemini_webapi.utils.profile_utils import (
     get_active_thinking_level,
     SELECTED_THINKING_FILE,
 )
+
 from gemini_webapi.proxy.logging import (
     logger,
     mask_cookie,
@@ -183,9 +185,9 @@ def load_all_accounts() -> list[dict]:
                 return func()
 
     accounts = []
-    profiles = get_all_profiles()
+    active_profiles = get_active_profiles()
 
-    for p in profiles:
+    for p in active_profiles:
         _, cookie_path, _ = resolve_paths(p)
         psid, psidts = load_cookies_from_json(cookie_path)
         if psid and psidts:
@@ -208,6 +210,7 @@ def load_all_accounts() -> list[dict]:
         accounts.sort(key=lambda acc: 0 if acc["name"] == active_prof else 1)
 
     return accounts
+
 
 
 sync_locks = {}

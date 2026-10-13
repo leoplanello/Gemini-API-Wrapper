@@ -2,7 +2,7 @@ import re
 import time
 
 from curl_cffi.requests import AsyncSession, Cookies, Response
-import orjson as json
+from gemini_webapi.compat_json import json
 
 from .load_browser_cookies import HAS_BC3, load_browser_cookies
 from .logger import logger

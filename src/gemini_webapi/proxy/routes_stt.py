@@ -95,6 +95,14 @@ async def handle_speech_recognition(request: Request):
         # Decodifica base64 e empacota em WAV
         pcm_bytes = base64.b64decode(audio_b64)
 
+        # Clients like Pluely send a full WAV file instead of raw PCM: unwrap it
+        if pcm_bytes[:4] == b'RIFF' and pcm_bytes[8:12] == b'WAVE':
+            data_pos = pcm_bytes.find(b'data', 12)
+            if data_pos != -1:
+                import struct
+                sample_rate = struct.unpack('<I', pcm_bytes[24:28])[0] or sample_rate
+                pcm_bytes = pcm_bytes[data_pos + 8:]
+
         # 1. Verificar se o áudio é muito curto
         if len(pcm_bytes) < 3200:  # 0.1 segundo a 16kHz
             logger.warning("Received audio is too short.")

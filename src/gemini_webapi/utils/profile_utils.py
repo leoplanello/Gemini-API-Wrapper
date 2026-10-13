@@ -4,6 +4,7 @@ from typing import Tuple, List, Optional
 
 PROFILES_DIR = "profiles"
 SELECTED_PROFILE_FILE = ".selected_profile"
+ACTIVE_PROFILES_FILE = ".active_profiles"
 SELECTED_MODEL_FILE = ".selected_model"
 SELECTED_THINKING_FILE = ".thinking_level"
 
@@ -19,6 +20,63 @@ def get_active_profile(selected_profile_file: str = SELECTED_PROFILE_FILE) -> Op
         except Exception:
             pass
     return None
+
+
+def get_active_profiles(
+    active_profiles_file: str = ACTIVE_PROFILES_FILE,
+    selected_profile_file: str = SELECTED_PROFILE_FILE
+) -> List[str]:
+    """
+    Gets the list of currently active profiles.
+    Falls back to single active profile or all profiles if file is missing.
+    """
+    active_profiles = []
+    if os.path.exists(active_profiles_file):
+        try:
+            with open(active_profiles_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    prof = line.strip()
+                    if prof and prof not in active_profiles:
+                        active_profiles.append(prof)
+        except Exception:
+            pass
+
+    if active_profiles:
+        return active_profiles
+
+    single = get_active_profile(selected_profile_file)
+    if single:
+        return [single]
+
+    return get_all_profiles(selected_profile_file=selected_profile_file)
+
+
+def save_active_profiles(
+    profiles: List[str],
+    active_profiles_file: str = ACTIVE_PROFILES_FILE,
+    selected_profile_file: str = SELECTED_PROFILE_FILE
+):
+    """
+    Saves the list of active profiles to ACTIVE_PROFILES_FILE
+    and updates SELECTED_PROFILE_FILE with the primary profile.
+    """
+    clean_profiles = []
+    for p in profiles:
+        p_clean = p.strip()
+        if p_clean and p_clean not in clean_profiles:
+            clean_profiles.append(p_clean)
+
+    if not clean_profiles:
+        clean_profiles = ["cookies"]
+
+    with open(active_profiles_file, "w", encoding="utf-8") as f:
+        for p in clean_profiles:
+            f.write(f"{p}\n")
+
+    # Update .selected_profile with the first profile as primary
+    primary = clean_profiles[0]
+    with open(selected_profile_file, "w", encoding="utf-8") as f:
+        f.write(primary)
 
 
 def get_all_profiles(
